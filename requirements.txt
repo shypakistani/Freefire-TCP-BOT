@@ -1,0 +1,12 @@
+requests
+psutil
+PyJWT
+urllib3
+pytz
+aiohttp
+protobuf
+protobuf-decoder
+cfonts
+pycryptodome
+phonenumbers
+dnspython
