@@ -1,4 +1,4 @@
-# Freefire-tcp Bot
+# PakTcpBot Freefire  Bot
 
 A Python-based automation tool and bot for Garena Free Fire utilizing TCP communication protocols. It handles requests, custom emotes, headers, and token caching.
 
