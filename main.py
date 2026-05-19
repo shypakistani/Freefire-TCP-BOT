@@ -1,14 +1,15 @@
 # ======================== IMPORTS =======================
-import requests , os , psutil , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio , subprocess
-from MG24GAMER import DEcwHisPErMsG_pb2 , MajoRLoGinrEs_pb2 , PorTs_pb2 , MajoRLoGinrEq_pb2 , sQ_pb2 , Team_msg_pb2, RemoveFriend_Req_pb2, GetFriend_Res_pb2, spam_request_pb2, devxt_count_pb2, dev_generator_pb2, kyro_title_pb2, room_join_pb2
+import requests, os, jwt, json, binascii, time, urllib3, base64, re
+import socket, threading, ssl, pytz, aiohttp, traceback, asyncio, subprocess
+import datetime
+from MG24GAMER import DEcwHisPErMsG_pb2, MajoRLoGinrEs_pb2, PorTs_pb2, MajoRLoGinrEq_pb2, sQ_pb2, Team_msg_pb2, RemoveFriend_Req_pb2, GetFriend_Res_pb2, spam_request_pb2, devxt_count_pb2, dev_generator_pb2, kyro_title_pb2, room_join_pb2
 from protobuf_decoder.protobuf_decoder import Parser
-from xC4 import * ; from xHeaders import *
+from xC4 import *; from xHeaders import *
 from datetime import datetime
 import urllib.parse
 from google.protobuf.timestamp_pb2 import Timestamp
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from cfonts import render, say
 import google.protobuf.json_format as json_format
 import random
 from Crypto.Cipher import AES
@@ -117,14 +118,16 @@ key2 = "mg24"
 BYPASS_TOKEN = "your_bypass_token_here"
 YOUTUBE_API_KEY = "AIzaSyBVP3NiKKJvb-0ar2J3y9IFVVHHWRng4nA"
 GEMINI_AI_API_KEY = "AIzaSyADPE-gPODMslNB6AElglDtBRv6PQDVChY"
-GROQ_AI_API_KEY = "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"
+GROQ_AI_API_KEY = None
+OPENROUTER_AI_API_KEY = "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"
 IG_SESSION_ID = ""  # Paste your Instagram sessionid cookie here to unlock private account stats
 WHITELIST_ONLY = False
 bot_enabled = True
 _bot_jwt = None          # Holds the main bot JWT — reused for bio updates
 BOT_OWNER_UID = 415136165  
 BOT_SERVER_URL = None  # Set from login response — used for friend add/remove/list
-PLAYER_NAME_CACHE = {}  
+PLAYER_NAME_CACHE = {}   # bounded below — evicts oldest when full
+_PLAYER_NAME_CACHE_MAX = 500
 freeze_running = False
 freeze_task = None
 FREEZE_EMOTES = [909052010, 909052010, 909052010]
@@ -279,9 +282,8 @@ async def fetch_news_rss(country_code):
         "Write in natural, conversational sentences. No bullet points. Keep it short. Write in English."
     )
     try:
-        loop = asyncio.get_running_loop()
         ai_summary = await asyncio.wait_for(
-            loop.run_in_executor(None, talk_with_ai, prompt),
+            talk_with_ai(prompt),
             timeout=60,
         )
         if not ai_summary:
@@ -398,9 +400,6 @@ def decode_player_info(binary):
     info.ParseFromString(binary)
     return info    
     
-import requests
-import json
-
 def load_jwt_token():
     """Load token from token.json"""
     try:
@@ -1554,7 +1553,8 @@ def get_leader(packet):
 
 # Add near top with other globals
 status_queue = asyncio.Queue()
-cache_dict = {}
+cache_dict: dict = {}
+_CACHE_DICT_MAX = 1000  # evict oldest entries when over this size
 
 # In TcPOnLine, instead of caching directly:
 async def handle_status_response(hex_data):
@@ -1568,233 +1568,145 @@ async def handle_status_response(hex_data):
             'data': cache_entry
         })
         
-        print(f"📤 Queued status for {xMsGFixinG(target_uid)}")
-        
-    except Exception as e:
-        print(f"❌ Queue error: {e}")
+    except Exception:
+        pass
 
 # In TcPChaT, add a queue consumer
 async def cache_consumer():
-    """Consume status responses from queue"""
+    """Consume status responses from queue and keep cache_dict bounded."""
     while True:
         try:
             item = await status_queue.get()
             player_id = item['player_id']
+            # evict oldest entry if at cap
+            if len(cache_dict) >= _CACHE_DICT_MAX:
+                try:
+                    cache_dict.pop(next(iter(cache_dict)))
+                except StopIteration:
+                    pass
             cache_dict[player_id] = item['data']
-            print(f"📥 Cache updated for {xMsGFixinG(target_uid)}")
             status_queue.task_done()
-        except Exception as e:
-            print(f"❌ Consumer error: {e}")
-        await asyncio.sleep(0.1)
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
 
 
 
 # Start consumer in your main function
 async def StarTinG():
-    # Start consumer
+    # Start long-lived background workers once
     consumer_task = asyncio.create_task(cache_consumer())
-    
+    sweeper_task  = asyncio.create_task(_cache_sweeper())
+
     while True:
+        # Clear accumulated state before every (re)start so memory doesn't grow across cycles
+        _mem_cache.clear()
+        cache_dict.clear()
+
         try:
-            await asyncio.wait_for(MaiiiinE(), timeout = 7 * 60 * 60)
+            await asyncio.wait_for(MaiiiinE(), timeout=7 * 60 * 60)
         except KeyboardInterrupt:
             consumer_task.cancel()
+            sweeper_task.cancel()
             break
-        except asyncio.TimeoutError: 
+        except asyncio.TimeoutError:
             print("Token ExpiRed ! , ResTartinG")
-        except Exception as e: 
+        except Exception as e:
             print(f"ErroR TcP - {e} => ResTarTinG ...")
 
-import pickle
-import os
-import time
+# ── In-memory TTL cache (replaces slow pickle file I/O) ──
+CACHE_TIMEOUT = 30  # seconds before a cache entry expires
+_mem_cache: dict = {}  # {str(player_id): {'data': ..., 'saved_at': float}}
 
-CACHE_FILE = 'status_cache.pkl'
-CACHE_TIMEOUT = 30  # Cache entries expire after 30 seconds
+async def _cache_sweeper():
+    """Background task: purge expired _mem_cache entries every 60 seconds."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = time.time()
+            expired = [k for k, v in _mem_cache.items()
+                       if now - v.get('saved_at', 0) > CACHE_TIMEOUT]
+            for k in expired:
+                _mem_cache.pop(k, None)
+        except Exception:
+            pass
 
 def save_to_cache(player_id, data):
-    """Save status to file cache with timestamp"""
-    try:
-        # Load existing cache
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, 'rb') as f:
-                    cache = pickle.load(f)
-            except:
-                cache = {}
-        else:
-            cache = {}
-        
-        # Add timestamp
-        data['saved_at'] = time.time()
-        
-        # Update cache
-        cache[str(player_id)] = data
-        
-        # Save back
-        with open(CACHE_FILE, 'wb') as f:
-            pickle.dump(cache, f)
-        
-        print(f"💾 Saved to file cache: {xMsGFixinG(target_uid)}")
-        return True
-    except Exception as e:
-        print(f"❌ Cache save error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    """Save status to in-memory cache with timestamp (no disk I/O)."""
+    data = dict(data)
+    data['saved_at'] = time.time()
+    _mem_cache[str(player_id)] = data
+    return True
 
 def load_from_cache(player_id):
-    """Load status from file cache, check expiration"""
-    try:
-        if not os.path.exists(CACHE_FILE):
-            return None
-        
-        with open(CACHE_FILE, 'rb') as f:
-            cache = pickle.load(f)
-        
-        player_key = str(player_id)
-        if player_key in cache:
-            data = cache[player_key]
-            
-            # Check if cache is expired
-            if 'saved_at' in data:
-                if time.time() - data['saved_at'] > CACHE_TIMEOUT:
-                    print(f"⏰ Cache expired for {xMsGFixinG(target_uid)}")
-                    del cache[player_key]
-                    with open(CACHE_FILE, 'wb') as f:
-                        pickle.dump(cache, f)
-                    return None
-            
-            print(f"📥 Loaded from cache: {xMsGFixinG(target_uid)}")
-            return data
-        
+    """Load from in-memory cache; returns None if missing or expired."""
+    entry = _mem_cache.get(str(player_id))
+    if entry is None:
         return None
-    except Exception as e:
-        print(f"❌ Cache load error: {e}")
+    if time.time() - entry.get('saved_at', 0) > CACHE_TIMEOUT:
+        _mem_cache.pop(str(player_id), None)
         return None
+    return entry
 
 def clear_cache_entry(player_id):
-    """Clear specific cache entry"""
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'rb') as f:
-                cache = pickle.load(f)
-            
-            player_key = str(player_id)
-            if player_key in cache:
-                del cache[player_key]
-                
-            with open(CACHE_FILE, 'wb') as f:
-                pickle.dump(cache, f)
-            print(f"🗑️ Cleared cache for {xMsGFixinG(target_uid)}")
-    except Exception as e:
-        print(f"❌ Clear cache error: {e}")
+    """Remove a single cache entry."""
+    _mem_cache.pop(str(player_id), None)
 
 def debug_file_cache():
-    """Debug the file cache"""
+    """Show current in-memory cache contents."""
+    print(f"\n📁 CACHE DEBUG: {len(_mem_cache)} entries")
+    for uid, data in _mem_cache.items():
+        age = time.time() - data.get('saved_at', 0)
+        print(f"  {uid}: {data.get('status', 'NO STATUS')} (age: {age:.1f}s)")
+    print("---\n")
+    return _mem_cache
+
+
+    
+    
+async def get_account_token(uid, password):
+    """Get access token for a specific account"""
     try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'rb') as f:
-                cache = pickle.load(f)
-            print(f"\n📁 FILE CACHE DEBUG:")
-            print(f"Size: {len(cache)} entries")
-            for uid, data in cache.items():
-                age = time.time() - data.get('saved_at', 0)
-                status = data.get('status', 'NO STATUS')
-                print(f"  {uid}: {status} (age: {age:.1f}s)")
-            print("---\n")
-            return cache
-        else:
-            print("📁 No cache file exists")
-            return {}
+        url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+        headers = {
+            "Host": "100067.connect.garena.com",
+            "User-Agent": await Ua(),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "close"
+        }
+        data = {
+            "uid": uid,
+            "password": password,
+            "response_type": "token",
+            "client_type": "2",
+            "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+            "client_id": "100067"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=data) as response:
+                if response.status == 200:
+                    resp_data = await response.json()
+                    return resp_data.get("open_id"), resp_data.get("access_token")
+        return None, None
     except Exception as e:
-        print(f"❌ Cache debug error: {e}")
-        return {}
+        print(f"❌ Error getting token for {uid}: {e}")
+        return None, None
 
-def load_from_cache(player_id):
-    """Load status from file cache"""
+async def send_join_from_account(target_uid, account_uid, password, key, iv, region):
+    """Send join request from a specific account"""
     try:
-        if not os.path.exists(CACHE_FILE):
-            return None
-        
-        with open(CACHE_FILE, 'rb') as f:
-            cache = pickle.load(f)
-        
-        if player_id in cache:
-            return cache[player_id]
-        return None
+        open_id, access_token = await get_account_token(account_uid, password)
+        if not open_id or not access_token:
+            return False
+        join_packet = await create_account_join_packet(target_uid, account_uid, open_id, access_token, key, iv, region)
+        if join_packet:
+            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
+            return True
+        return False
     except Exception as e:
-        print(f"❌ Cache load error: {e}")
-        return None
-
-def clear_cache_entry(player_id):
-    """Clear specific cache entry"""
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'rb') as f:
-                cache = pickle.load(f)
-            
-            if player_id in cache:
-                del cache[player_id]
-                
-            with open(CACHE_FILE, 'wb') as f:
-                pickle.dump(cache, f)
-    except:
-        pass
-
-
-    
-    
-    async def get_account_token(self, uid, password):
-        """Get access token for a specific account"""
-        try:
-            url = "https://100067.connect.garena.com/oauth/guest/token/grant"
-            headers = {
-                "Host": "100067.connect.garena.com",
-                "User-Agent": await Ua(),
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "close"
-            }
-            data = {
-                "uid": uid,
-                "password": password,
-                "response_type": "token",
-                "client_type": "2",
-                "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-                "client_id": "100067"
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, data=data) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        open_id = data.get("open_id")
-                        access_token = data.get("access_token")
-                        return open_id, access_token
-            return None, None
-        except Exception as e:
-            print(f"❌ Error getting token for {uid}: {e}")
-            return None, None
-    
-    async def send_join_from_account(self, target_uid, account_uid, password, key, iv, region):
-        """Send join request from a specific account"""
-        try:
-            # Get token for this account
-            open_id, access_token = await self.get_account_token(account_uid, password)
-            if not open_id or not access_token:
-                return False
-            
-            # Create join packet using the account's credentials
-            join_packet = await self.create_account_join_packet(target_uid, account_uid, open_id, access_token, key, iv, region)
-            if join_packet:
-                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
-                return True
-            return False
-            
-        except Exception as e:
-            print(f"❌ Error sending join from {account_uid}: {e}")
-            return False
+        print(f"❌ Error sending join from {account_uid}: {e}")
+        return False
 
 async def join_custom_room(room_id, room_password, key, iv, region):
     """Join custom room with proper Free Fire packet structure"""
@@ -3486,7 +3398,85 @@ async def send_youtube_info(channel_name, chat_type, uid, chat_id, key, iv):
             f"[B][C][FF0000]❌ YouTube command crashed: {e}\n",
             uid, chat_id, key, iv)
 
-import requests
+async def get_player_info(uid):
+    """Fetch full player info from the info API and return a formatted chat message."""
+    url = f"https://info-psi-ten.vercel.app/info?uid={uid}&region=PK"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as res:
+                if res.status != 200:
+                    return f"[B][C][FF0000]❌ API Error: Status {res.status}"
+                data = await res.json(content_type=None)
+    except asyncio.TimeoutError:
+        return "[B][C][FF0000]❌ Info API timed out. Try again."
+    except Exception as e:
+        return f"[B][C][FF0000]❌ Network error: {e}"
+
+    b   = data.get("basicinfo", {})
+    cl  = data.get("clanbasicinfo", {})
+    pet = data.get("petinfo", {})
+    soc = data.get("socialinfo", {})
+    cr  = data.get("creditscoreinfo", {})
+
+    # last login & created at — timezone-aware UTC conversion
+    try:
+        import datetime as _datetime_mod
+        last_login = _datetime_mod.datetime.fromtimestamp(
+            int(b.get("lastloginat", 0)), _datetime_mod.timezone.utc
+        ).strftime("%d %b %Y")
+    except Exception:
+        last_login = "N/A"
+    try:
+        import datetime as _datetime_mod
+        created_at = _datetime_mod.datetime.fromtimestamp(
+            int(b.get("createat", 0)), _datetime_mod.timezone.utc
+        ).strftime("%d %b %Y")
+    except Exception:
+        created_at = "N/A"
+
+    gender_raw = soc.get("gender", "")
+    gender = "♀ Female" if "FEMALE" in gender_raw else ("♂ Male" if "MALE" in gender_raw else "—")
+
+    bio = soc.get("signature", "—").strip() or "—"
+
+    guild_name  = cl.get("clanname", "No Guild")
+    guild_level = cl.get("clanlevel", "—")
+    guild_count = f"{cl.get('membernum', '?')}/{cl.get('capacity', '?')}"
+
+    pet_name  = pet.get("name", "—")
+    pet_level = pet.get("level", "—")
+
+    credit = cr.get("creditscore", "—")
+
+    msg = (
+        f"[B][C][FFD700]━━━━━━━━━━━━━━━━━━━━\n"
+        f"[B][C][00FFFF]🎮 PLAYER INFO\n"
+        f"[B][C][FFD700]━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"[FFD700]👤 Name    : [FFFFFF]{xMsGFixinG(b.get('nickname', '—'))}\n"
+        f"[FFD700]🆔 UID     : [AAFFAA]{xMsGFixinG(str(b.get('accountid', uid)))}\n"
+        f"[FFD700]🌍 Region  : [FFFFFF]{b.get('region', 'PK')}\n"
+        f"[FFD700]⚧  Gender  : [FFFFFF]{gender}\n"
+        f"\n"
+        f"[00FFFF]🏅 Level   : [FFFFFF]{b.get('level', '—')}   🔖 EXP: {b.get('exp', '—')}\n"
+        f"[00FFFF]🎖  BR Rank : [FFFFFF]{b.get('rank', '—')} ({b.get('rankingpoints', 0)} pts)\n"
+        f"[00FFFF]⚔  CS Rank : [FFFFFF]{b.get('csrank', '—')} ({b.get('csrankingpoints', 0)} pts)\n"
+        f"[00FFFF]❤  Likes   : [FFFFFF]{b.get('liked', 0)}\n"
+        f"[00FFFF]🏆 Badges  : [FFFFFF]{b.get('badgecnt', 0)}\n"
+        f"\n"
+        f"[FF88FF]🏰 Guild   : [FFFFFF]{xMsGFixinG(guild_name)} (Lv.{guild_level})\n"
+        f"[FF88FF]👥 Members : [FFFFFF]{guild_count}\n"
+        f"\n"
+        f"[FFAA00]🐾 Pet     : [FFFFFF]{pet_name} (Lv.{pet_level})\n"
+        f"[FFAA00]⭐ Credit  : [FFFFFF]{credit}/100\n"
+        f"[FFAA00]🕐 Last Login : [FFFFFF]{last_login}\n"
+        f"[FFAA00]📅 Created At : [FFFFFF]{created_at}\n"
+        f"\n"
+        f"[AAAAAA]📝 Bio: [FFFFFF]{bio}\n"
+        f"\n"
+        f"[B][C][FFD700]━━━━━━━━━━━━━━━━━━━━"
+    )
+    return msg
 
 def get_level_info(player_id):
     url = f"https://your-api.vercel.app/level/level?uid={player_id}"
@@ -4483,10 +4473,6 @@ def get_item_info(item_id):
     except Exception:
         return "[FF0000]SERVER ERROR"
 
-import requests
-from datetime import datetime
-
-
 # Human readable time (uses the definition above — this duplicate is kept for compatibility)
 def human_time(unix_timestamp):
     try:
@@ -4693,56 +4679,56 @@ def send_visits(player_id):
         print(f"Could not connect to visit API: {e}")
         return "Failed to connect to visit API."
 #CHAT WITH AI (Google Gemini with Groq fallback)
-def _try_gemini(question):
-    """Try Google Gemini. Returns (text, success)."""
+async def _try_gemini(question):
+    """Try Google Gemini. Returns (text, success). Fully async — no thread blocking."""
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_AI_API_KEY}"
-        headers = {"Content-Type": "application/json"}
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-1.5-flash:generateContent?key={GEMINI_AI_API_KEY}"
+        )
         payload = {
             "contents": [{"parts": [{"text": f"You are a helpful assistant. Keep responses short and clear.\n\nUser: {question}"}]}],
             "generationConfig": {"maxOutputTokens": 500, "temperature": 0.7}
         }
-        res = requests.post(url, headers=headers, json=payload, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "").strip(), True
-            return None, False
-        elif res.status_code == 429:
-            return None, False  # quota exceeded — trigger fallback
-        else:
-            return None, False
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "").strip(), True
+                return None, False
     except Exception:
         return None, False
 
-def _try_groq(question):
-    """Primary AI - Groq fast models (llama-3.3-70b → llama3-70b → gemma2-9b)."""
-    try:
-        today = datetime.now().strftime("%B %d, %Y")
-        headers = {
-            "Authorization": f"Bearer {GROQ_AI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        # Fast reliable Groq models — no slow/external models
-        models_to_try = [
-            "llama-3.3-70b-versatile",
-            "llama3-70b-8192",
-            "gemma2-9b-it",
-        ]
-        system_prompt = (
-            f"You are a personal assistant for GothicRealm Guild. Today's date is {today}. "
-            "ONLY if the user's message is a greeting (hello, hi, hey, sup, yo, wassup, or similar), respond warmly and introduce yourself like this: "
-            "say you are the AI assistant of GothicRealm Guild, that you are an AI model created, trained, and running locally 24/7 by Ayaan Ghaffar. "
-            "For ALL other messages, answer directly without any introduction or self-description. Do NOT mention GothicRealm Guild or introduce yourself unless greeted. "
-            "Answer questions confidently and helpfully. "
-            "If asked about recent events you don't know about, say you don't have info on that specific event but still help as much as you can. "
-            "Never say you are outdated or that your training was cut off — just answer. "
-            "Keep responses short and clear."
-        )
-        last_error = None
+async def _try_openrouter(question):
+    """Primary AI — OpenRouter free models. Fully async — no thread blocking."""
+    if not OPENROUTER_AI_API_KEY:
+        return "❌ OpenRouter API key not set.", False
+    today = datetime.now().strftime("%B %d, %Y")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_AI_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://gothicrealm.bot",
+        "X-Title": "GothicRealm Bot"
+    }
+    models_to_try = [
+        "openrouter/free",
+    ]
+    system_prompt = (
+        f"You are a personal assistant for GothicRealm Guild. Today's date is {today}. "
+        "ONLY if the user's message is a greeting (hello, hi, hey, sup, yo, wassup, or similar), respond warmly and introduce yourself like this: "
+        "say you are the AI assistant of GothicRealm Guild, that you are an AI model created, trained, and running locally 24/7 by Ayaan Ghaffar. "
+        "For ALL other messages, answer directly without any introduction or self-description. Do NOT mention GothicRealm Guild or introduce yourself unless greeted. "
+        "Answer questions confidently and helpfully. "
+        "If asked about recent events you don't know about, say you don't have info on that specific event but still help as much as you can. "
+        "Never say you are outdated or that your training was cut off — just answer. "
+        "Keep responses short and clear."
+    )
+    last_error = "no models tried"
+    async with aiohttp.ClientSession() as session:
         for model in models_to_try:
             try:
                 payload = {
@@ -4755,41 +4741,40 @@ def _try_groq(question):
                     "temperature": 0.7,
                     "stream": False
                 }
-                res = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers, json=payload, timeout=8
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    return data["choices"][0]["message"]["content"].strip(), True
-                elif res.status_code == 429:
-                    last_error = f"rate limited on {model}"
-                    continue  # Try next model
-                else:
-                    last_error = f"error {res.status_code} on {model}"
-                    continue
-            except requests.Timeout:
+                async with session.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as res:
+                    if res.status == 200:
+                        data = await res.json()
+                        return data["choices"][0]["message"]["content"].strip(), True
+                    elif res.status == 429:
+                        last_error = f"rate limited on {model}"
+                    else:
+                        last_error = f"error {res.status} on {model}"
+            except asyncio.TimeoutError:
                 last_error = f"timeout on {model}"
-                continue
             except Exception as ex:
                 last_error = str(ex)
-                continue
-        return f"❌ AI error: {last_error}", False
-    except Exception as e:
-        return f"❌ AI error: {e}", False
+    return f"❌ AI error: {last_error}", False
 
-def talk_with_ai(question):
-    # Try Groq first (primary)
-    result, ok = _try_groq(question)
-    if ok and result:
-        return result
+async def talk_with_ai(question):
+    """Async AI entry point — tries OpenRouter first, falls back to Gemini."""
+    or_result, or_ok = await _try_openrouter(question)
+    if or_ok and or_result:
+        return or_result
 
-    # Fallback to Gemini
-    result, ok = _try_gemini(question)
-    if ok and result:
-        return result
+    gem_result, gem_ok = await _try_gemini(question)
+    if gem_ok and gem_result:
+        return gem_result
 
-    return "❌ AI is busy right now. Try again in a moment."
+    # Return the most useful error so the user can diagnose
+    if or_result:
+        return or_result
+    if gem_result:
+        return gem_result
+    return "❌ AI is unavailable right now. Check your OpenRouter/Gemini API keys."
 
 
 ####################################
@@ -5073,24 +5058,23 @@ async def EncRypTMajoRLoGin(open_id, access_token):
     string = major_login.SerializeToString()
     return  await encrypted_proto(string)
 
+# SSL context created once — reused for all login calls (avoids cert-loading overhead per call)
+_no_verify_ssl = ssl.create_default_context()
+_no_verify_ssl.check_hostname = False
+_no_verify_ssl.verify_mode = ssl.CERT_NONE
+
 async def MajorLogin(payload):
     url = "https://loginbp.ggblueshark.com/MajorLogin"
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload, headers=Hr, ssl=ssl_context) as response:
+        async with session.post(url, data=payload, headers=Hr, ssl=_no_verify_ssl) as response:
             if response.status == 200: return await response.read()
             return None
 
 async def GetLoginData(base_url, payload, token):
     url = f"{base_url}/GetLoginData"
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    Hr['Authorization']= f"Bearer {token}"
+    Hr['Authorization'] = f"Bearer {token}"
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload, headers=Hr, ssl=ssl_context) as response:
+        async with session.post(url, data=payload, headers=Hr, ssl=_no_verify_ssl) as response:
             if response.status == 200: return await response.read()
             return None
 
@@ -9009,9 +8993,8 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                                 
                                 try:
-                                    ai_loop = asyncio.get_running_loop()
                                     ai_response = await asyncio.wait_for(
-                                        ai_loop.run_in_executor(None, talk_with_ai, question),
+                                        talk_with_ai(question),
                                         timeout=25
                                     )
                                 except asyncio.TimeoutError:
@@ -9671,9 +9654,8 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             f"Do NOT guess or mention the owner name. "
                                             f"Reply in plain text, no bullet points, no markdown."
                                         )
-                                        _loop2 = asyncio.get_running_loop()
                                         _ai_raw = await asyncio.wait_for(
-                                            _loop2.run_in_executor(None, talk_with_ai, _ai_prompt),
+                                            talk_with_ai(_ai_prompt),
                                             timeout=15
                                         )
                                         if _ai_raw and len(_ai_raw.strip()) > 10 and "unknown" not in _ai_raw.lower()[:30]:
@@ -9835,6 +9817,33 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     await safe_send_message(response.Data.chat_type, level_result, uid, chat_id, key, iv)
 
                                 #GET PLAYER CHECK ID
+
+                        if inPuTMsG.startswith('/info'):
+                            parts = inPuTMsG.split()
+                            if len(parts) < 2:
+                                await safe_send_message(
+                                    response.Data.chat_type,
+                                    "[B][C][FF0000]❌ Usage: /info <uid>\nExample: /info 1901614992",
+                                    uid, chat_id, key, iv
+                                )
+                            else:
+                                target_uid_info = parts[1].strip()
+                                await safe_send_message(
+                                    response.Data.chat_type,
+                                    f"[B][C][00FFFF]🔍 Fetching info for {xMsGFixinG(target_uid_info)}...",
+                                    uid, chat_id, key, iv
+                                )
+                                try:
+                                    info_result = await asyncio.wait_for(
+                                        get_player_info(target_uid_info),
+                                        timeout=15
+                                    )
+                                except asyncio.TimeoutError:
+                                    info_result = "[B][C][FF0000]❌ Request timed out. Try again."
+                                except Exception as _ie:
+                                    info_result = f"[B][C][FF0000]❌ Error: {_ie}"
+                                await safe_send_message(response.Data.chat_type, info_result, uid, chat_id, key, iv)
+
                         # Command handler for remove
                         if inPuTMsG.strip().startswith('/wlremove'):
                             parts = inPuTMsG.strip().split()
@@ -12219,28 +12228,15 @@ async def MaiiiinE():
     print("💡 Type /help for command list")
     print("=" * 50)
     
-    # Test cache file write
-    print("\n📊 System Check:")
-    print(f"📁 Working directory: {os.getcwd()}")
-    print(f"📁 Cache file: {CACHE_FILE}")
-    
-    try:
-        test_data = {'test': 'ok', 'timestamp': time.time()}
-        with open(CACHE_FILE, 'wb') as f:
-            pickle.dump(test_data, f)
-        print("✅ Cache file write test: PASSED")
-    except Exception as e:
-        print(f"⚠️ Cache file write test: {e}")
-    
     # Check token.json exists
+    print("\n📊 System Check:")
     if os.path.exists("token.json"):
-        print("✅ token.json file exists")
         try:
             with open("token.json", "r") as f:
                 token_info = json.load(f)
             age = time.time() - token_info.get('saved_at', 0)
-            print(f"✅ Token age: {age:.1f} seconds")
-        except:
+            print(f"✅ token.json exists (age: {age:.1f}s)")
+        except Exception:
             print("⚠️ Could not read token.json")
     else:
         print("❌ token.json not found!")
