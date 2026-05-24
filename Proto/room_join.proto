@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+message join_room {
+    // Main packet type: 3 = Room Join
+    int32 field_1 = 1;  // Always 3
+    
+    // Room information
+    message RoomInfo {
+        // Field 1: Room ID (64-bit because IDs can be large)
+        int64 field_1 = 1;    // room_id
+        
+        // Field 2: Password
+        string field_2 = 2;   // password
+        
+        // Field 8: Device/Region information
+        message DeviceInfo {
+            string field_1 = 1;  // "IDC3" (Device identifier)
+            int32 field_2 = 2;   // 149 (Device type code)
+            string field_3 = 3;  // "IND" (Region code)
+        }
+        DeviceInfo field_8 = 8;
+        
+        // Field 9: Session/Timestamp data (13 bytes)
+        // \x01\x03\x04\x07\x09\x0a\x0b\x12\x0e\x16\x19\x20\x1d
+        // This is BINARY data, not string!
+        bytes field_9 = 9;
+        
+        // Field 10: Unknown flag (always 1)
+        int32 field_10 = 10;
+        
+        // Field 12: Empty field (must be present)
+        message EmptyField {}
+        EmptyField field_12 = 12;
+        
+        // Field 13: Unknown (always 1)
+        int32 field_13 = 13;
+        
+        // Field 14: Unknown (always 1)
+        int32 field_14 = 14;
+        
+        // Field 16: Language
+        string field_16 = 16;  // "en"
+        
+        // Field 22: Player information
+        message PlayerInfo {
+            int32 field_1 = 1;  // 21 (Player level/rank?)
+        }
+        PlayerInfo field_22 = 22;
+    }
+    
+    RoomInfo field_2 = 2;
+}
